@@ -90,7 +90,8 @@ Under cron, the messaging gateway and other unattended runs nobody can answer an
 
 ## Disclosure
 
-- **Network.** Forecasts send read-only metadata requests to `pypi.org`, `api.github.com`, `auth.docker.io`, `registry-1.docker.io`, `huggingface.co` and `registry.ollama.ai`, and one header-only request to a URL that appears in a `curl`/`wget` command. Only the package, repository, image or model name is sent. No credentials, tokens or headers from your command are forwarded, and local or private addresses are never probed. These requests happen before the command reaches Hermes's approval prompt.
+- **Network.** Forecasts send read-only metadata requests to `pypi.org`, `api.github.com`, `auth.docker.io`, `registry-1.docker.io`, `huggingface.co` and `registry.ollama.ai`, and one header-only request to a URL that appears in a `curl`/`wget` command. Only the package, repository, image or model name is sent. No credentials, tokens or headers from your command are forwarded. These requests happen before the command reaches Hermes's approval prompt.
+- **URL probes.** Before a URL is probed its hostname is resolved, and the probe is sent only if Hermes's `is_safe_url` accepts it and every address it resolves to is public. Redirects are not followed automatically: each hop is checked the same way first, up to four hops. A name that does not resolve, or that points at a private, loopback or link-local address (including the cloud metadata address), is never probed.
 - **Storage.** A SQLite ledger in `<HERMES_HOME>/plugin-data/data-saver/data.db`: time, tool name, bytes, and the first 300 characters of the command or URL. It never leaves your machine.
 - **No telemetry, no self-update, no shell commands, no background process, no stored credentials.**
 - It never auto-approves anything. It only adds approval prompts and blocks; your existing guards are untouched.
@@ -110,7 +111,7 @@ pip install pytest
 python -m pytest tests
 ```
 
-93 tests, no network: parsing, every resolver against recorded registry responses, the budget policy, overlap-safe metering, and a check that `register()` matches `plugin.yaml`.
+114 tests, no network: parsing, every resolver against recorded registry responses, the budget policy, overlap-safe metering, and a check that `register()` matches `plugin.yaml`.
 
 ## License
 

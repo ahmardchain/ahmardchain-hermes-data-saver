@@ -15,6 +15,7 @@ import json
 import platform
 import re
 import shlex
+import socket
 import threading
 import time
 import urllib.error
@@ -28,6 +29,7 @@ USER_AGENT = "hermes-data-saver/0.1 (+https://github.com/ahmardchain/ahmardchain
 _MAX_BODY = 8 * 1024 * 1024
 _HEADER_OVERHEAD = 700  # rough request + response header bytes per lookup
 _MAX_PIP_PACKAGES = 60
+_MAX_REDIRECTS = 4
 _CACHE_TTL = 600.0
 
 _OPERATORS = {";", "&&", "||", "|", "&", "(", ")", "|&", ";;"}
@@ -112,6 +114,7 @@ class Fetcher:
     def __init__(self, opener: Optional[Callable[..., Any]] = None, *, deadline_s: float = 10.0,
                  timeout_s: float = 6.0, clock: Callable[[], float] = time.monotonic):
         self._open = opener or urllib.request.urlopen
+        self._open_probe = opener or _probe_opener.open  # never follows redirects
         self._clock = clock
         self._deadline = clock() + deadline_s
         self._timeout = timeout_s
@@ -154,34 +157,105 @@ class Fetcher:
             return None
 
     def content_length(self, url: str) -> Optional[int]:
-        """Size of the resource behind a URL, from response headers only."""
-        timeout = self._remaining()
-        if not timeout:
+        """Size of the resource behind a URL, from response headers only.
+
+        Redirects are not followed by the HTTP client: each hop is checked with
+        ``is_probe_safe`` before it is requested, so a public URL cannot bounce the
+        probe to a private, loopback or link-local address.
+        """
+        for _hop in range(_MAX_REDIRECTS + 1):
+            if not is_probe_safe(url):
+                return None
+            timeout = self._remaining()
+            if not timeout:
+                return None
+            self._charge(_HEADER_OVERHEAD)
+            # Ask for one byte: servers that ignore HEAD still answer with the full size in Content-Range.
+            request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Range": "bytes=0-0"})
+            try:
+                with self._open_probe(request, timeout=timeout) as response:
+                    headers = response.headers
+                    status = getattr(response, "status", 200)
+            except urllib.error.HTTPError as error:
+                headers, status = error.headers, error.code
+            except Exception:
+                return None
+            if status in (301, 302, 303, 307, 308):
+                location = (headers.get("Location") or "").strip() if headers else ""
+                if not location:
+                    return None
+                url = urllib.parse.urljoin(url, location)
+                continue
+            if not 200 <= status < 300:
+                return None
+            linked = headers.get("X-Linked-Size")
+            if linked and linked.isdigit():
+                return int(linked)
+            match = re.search(r"/(\d+)\s*$", headers.get("Content-Range") or "")
+            if match:
+                return int(match.group(1))
+            length = headers.get("Content-Length")
+            if status == 200 and length and length.isdigit():
+                return int(length)
             return None
-        self._charge(_HEADER_OVERHEAD)
-        # Ask for one byte: servers that ignore HEAD still answer with the full size in Content-Range.
-        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Range": "bytes=0-0"})
-        try:
-            with self._open(request, timeout=timeout) as response:
-                headers = response.headers
-                linked = headers.get("X-Linked-Size")
-                content_range = headers.get("Content-Range") or ""
-                length = headers.get("Content-Length")
-                status = getattr(response, "status", 200)
-        except Exception:
-            return None
-        if linked and linked.isdigit():
-            return int(linked)
-        match = re.search(r"/(\d+)\s*$", content_range)
-        if match:
-            return int(match.group(1))
-        if status == 200 and length and length.isdigit():
-            return int(length)
         return None
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: the 3xx surfaces as an HTTPError the caller inspects."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_probe_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _resolve(host: str) -> list[str]:
+    """Every address a hostname resolves to. Raises OSError when it does not resolve."""
+    return sorted({info[4][0] for info in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)})
+
+
+resolve_host: Callable[[str], list[str]] = _resolve  # replaced in tests
+
+
+def _core_url_check(url: str) -> bool:
+    """Hermes's own SSRF check (resolves DNS, fails closed). True when Hermes is not importable,
+    as in the unit tests; the plugin's own resolution check below still applies."""
+    try:
+        from tools.url_safety import is_safe_url
+    except Exception:
+        return True
+    try:
+        return bool(is_safe_url(url))
+    except Exception:
+        return False
+
+
+def is_probe_safe(url: str) -> bool:
+    """True only when a URL may be probed: plain http(s), a public-looking name, accepted by
+    Hermes's ``is_safe_url``, and every address the name resolves to is globally routable.
+    Fails closed: a name that does not resolve is not probed."""
+    if not is_public_http_url(url) or not _core_url_check(url):
+        return False
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+        addresses = resolve_host(host)
+        if not addresses:
+            return False
+        for raw in addresses:
+            address = ipaddress.ip_address(raw.split("%", 1)[0])
+            mapped = getattr(address, "ipv4_mapped", None)
+            if not (mapped or address).is_global:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def is_public_http_url(url: str) -> bool:
-    """Only plain http(s) URLs on public hosts are probed; local and private addresses never are."""
+    """Cheap syntactic pre-check, no DNS: plain http(s), no credentials, not a local-looking name
+    or a literal non-public address. ``is_probe_safe`` is the check that decides."""
     try:
         parts = urllib.parse.urlsplit(url)
     except ValueError:
@@ -668,8 +742,8 @@ def _resolve_urls(fetcher: Fetcher, args: list[str], pipes_to_shell: bool) -> li
     items: list[Item] = []
     for url in _urls(args):
         short = url if len(url) <= 80 else url[:77] + "..."
-        if not is_public_http_url(url):
-            items.append(Item("url", short, None, "local or private address: not probed"))
+        if not is_probe_safe(url):
+            items.append(Item("url", short, None, "local, private or unresolvable address: not probed"))
             continue
         size = fetcher.content_length(url)
         if size is None:

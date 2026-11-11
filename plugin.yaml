@@ -1,5 +1,5 @@
 name: data-saver
-version: 0.1.0
+version: 0.1.1
 manifest_version: 2
 description: >-
   A mobile-data budget for Hermes. Forecasts how many megabytes a command will

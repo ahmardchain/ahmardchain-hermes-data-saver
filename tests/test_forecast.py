@@ -306,3 +306,95 @@ def test_ledger_backed_store_expires(monkeypatch):
     clock["now"] += 101
     assert ledger.get("pypi:alpha:latest", 100) is None
     assert ledger.get("missing", 100) is None
+
+
+# ── probe safety (SSRF) ───────────────────────────────────────────────────
+
+@pytest.mark.parametrize("url,ok", [
+    ("https://example.com/file.iso", True),
+    ("http://8.8.8.8/x", True),
+    ("https://rebind.example.org/x", False),        # public name -> 127.0.0.1
+    ("http://metadata.example.org/latest/", False),  # public name -> cloud metadata address
+    ("https://mixed.example.org/x", False),          # one private answer is enough
+    ("https://intranet.corp.example/x", False),      # intranet name -> 10.x
+    ("https://v6local.example.org/x", False),
+    ("https://mapped.example.org/x", False),         # IPv4-mapped private address
+    ("https://does-not-resolve.example/x", False),   # fails closed
+    ("http://localhost/x", False),
+    ("http://169.254.169.254/latest/meta-data", False),
+])
+def test_is_probe_safe_resolves_names_and_fails_closed(url, ok):
+    assert fc.is_probe_safe(url) is ok
+
+
+def test_probe_uses_hermes_url_check_when_available(monkeypatch):
+    import sys, types
+    seen = []
+    module = types.ModuleType("tools.url_safety")
+    module.is_safe_url = lambda url: (seen.append(url), False)[1]
+    monkeypatch.setitem(sys.modules, "tools", types.ModuleType("tools"))
+    monkeypatch.setitem(sys.modules, "tools.url_safety", module)
+    assert fc.is_probe_safe("https://example.com/a") is False
+    assert seen == ["https://example.com/a"]
+
+
+def redirect(url, location, code=302):
+    return urllib.error.HTTPError(url, code, "Found", {"Location": location}, None)
+
+
+class RedirectWeb(FakeWeb):
+    def __call__(self, request, timeout=None):
+        value = self.routes.get(request.full_url)
+        if isinstance(value, Exception):
+            self.calls.append(request)
+            raise value
+        return super().__call__(request, timeout)
+
+
+def test_probe_never_requests_a_name_that_resolves_to_a_private_address():
+    web = RedirectWeb({})
+    result = fc.forecast_command("curl -O https://rebind.example.org/a.iso http://metadata.example.org/x",
+                                 fetcher=fc.Fetcher(web), use_cache=False)
+    assert web.calls == []
+    assert len(result.unsized) == 2 and "not probed" in result.unsized[0].note
+
+
+def test_probe_follows_a_public_redirect_after_checking_the_hop():
+    web = RedirectWeb({
+        "https://example.com/a.iso": redirect("https://example.com/a.iso", "https://cdn.example.net/a.iso"),
+        "https://cdn.example.net/a.iso": FakeResponse(headers={"Content-Range": "bytes 0-0/5000"}, status=206),
+    })
+    assert fc.Fetcher(web).content_length("https://example.com/a.iso") == 5000
+    assert [call.full_url for call in web.calls] == ["https://example.com/a.iso", "https://cdn.example.net/a.iso"]
+
+
+@pytest.mark.parametrize("target", [
+    "http://127.0.0.1:8080/admin",
+    "http://169.254.169.254/latest/meta-data/",
+    "https://rebind.example.org/x",
+    "http://[::1]/x",
+    "/relative-is-fine-but-then-private",
+])
+def test_probe_does_not_follow_a_redirect_to_a_private_address(target):
+    routes = {"https://example.com/a.iso": redirect("https://example.com/a.iso", target)}
+    if target.startswith("/"):
+        routes["https://example.com/relative-is-fine-but-then-private"] = redirect(
+            "https://example.com/relative-is-fine-but-then-private", "http://10.0.0.1/")
+    web = RedirectWeb(routes)
+    assert fc.Fetcher(web).content_length("https://example.com/a.iso") is None
+    assert all(call.full_url.startswith("https://example.com/") for call in web.calls)
+
+
+def test_probe_stops_after_too_many_redirects():
+    routes = {f"https://example.com/{i}": redirect(f"https://example.com/{i}", f"https://example.com/{i + 1}")
+              for i in range(10)}
+    web = RedirectWeb(routes)
+    assert fc.Fetcher(web).content_length("https://example.com/0") is None
+    assert len(web.calls) == fc._MAX_REDIRECTS + 1
+
+
+def test_default_probe_opener_does_not_follow_redirects():
+    handler = fc._NoRedirect()
+    assert handler.redirect_request(None, None, 302, "Found", {}, "http://127.0.0.1/") is None
+    assert any(isinstance(h, fc._NoRedirect) for h in fc._probe_opener.handlers)
+    assert fc.Fetcher()._open_probe == fc._probe_opener.open
