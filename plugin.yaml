@@ -1,0 +1,53 @@
+name: data-saver
+version: 0.1.0
+manifest_version: 2
+description: >-
+  A mobile-data budget for Hermes. Forecasts how many megabytes a command will
+  download before it runs (pip, git clone, docker pull, Hugging Face, ollama,
+  curl/wget), sends anything over budget to Hermes's approval prompt, and
+  meters what every tool call and model request really used.
+author: AHMARD (@ahmardchain)
+license: MIT
+homepage: https://github.com/ahmardchain/ahmardchain-hermes-data-saver
+tags: [network, budget, metered, mobile-data, guard]
+requires_hermes: ">=0.23.0"
+provides_tools:
+  - data_usage
+  - data_forecast
+provides_hooks:
+  - pre_tool_call
+provides_middleware:
+  - tool_request
+  - tool_execution
+  - llm_execution
+config_schema:
+  daily_budget_mb:
+    type: int
+    default: 500
+    label: Daily data budget (MB)
+    description: Megabytes Hermes may use per day. 0 turns the daily budget off.
+  monthly_budget_mb:
+    type: int
+    default: 0
+    label: Monthly data budget (MB)
+    description: Megabytes Hermes may use per calendar month. 0 turns it off.
+  ask_above_mb:
+    type: int
+    default: 50
+    label: Ask before downloads larger than (MB)
+    description: A single forecast download above this size always goes to the approval prompt.
+  mode:
+    type: str
+    choices: [ask, enforce, observe]
+    default: ask
+    label: Mode
+    description: >-
+      ask sends over-budget downloads to Hermes's approval prompt; enforce
+      blocks them; observe only meters.
+  lean_below_pct:
+    type: int
+    default: 25
+    label: Lean mode below (% of budget left)
+    description: >-
+      When less than this share of the budget is left, web_extract and
+      web_search return smaller results. 0 turns lean mode off.
