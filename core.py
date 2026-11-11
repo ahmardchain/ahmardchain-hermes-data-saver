@@ -7,6 +7,8 @@ import json
 import time
 from typing import Any, Callable, Optional
 
+import threading
+
 from .forecast import Forecast, forecast_command, looks_like_download
 from .ledger import Ledger, day_key, month_key
 from .meter import Meter
@@ -28,6 +30,10 @@ NETWORK_TOOLS = frozenset({
 NETWORK_PREFIXES = ("browser_", "web_")
 NOISE_FLOOR = 2048  # bytes; smaller deltas are background chatter, not the tool call
 LEAN_EXTRACT_CHARS = 6000
+BACKGROUND_SOURCE = "terminal (background)"
+BACKGROUND_MAX_SECONDS = 20 * 60  # stop following a background download after this long
+BACKGROUND_IDLE_SECONDS = 20      # ...or once it has been quiet for this long
+BACKGROUND_IDLE_BYTES = 64 * 1024
 LEAN_SEARCH_RESULTS = 3
 
 
@@ -65,6 +71,9 @@ class DataSaver:
         self._set = set_config
         self._forecast = forecaster
         self._clock = clock
+        self._lock = threading.Lock()
+        self._expected: dict[str, int] = {}   # command -> forecast bytes, from pre_tool_call
+        self._background: dict[object, dict[str, Any]] = {}
 
     # ── settings ──────────────────────────────────────────────────────────
     def setting(self, key: str) -> Any:
@@ -135,6 +144,10 @@ class DataSaver:
             if not forecast.items:
                 return None
             total = forecast.total_bytes
+            with self._lock:
+                if len(self._expected) > 100:
+                    self._expected.clear()
+                self._expected[command] = total
             over = tight is not None and total > max(0, tight["left"])
             large = total > self.setting("ask_above_mb") * MB
             if not (over or large or spent_out):
@@ -217,6 +230,7 @@ class DataSaver:
     def _metered(self, category: str, source: str, detail: str, session_id: str, next_call: Any, payload: Any) -> Any:
         key = object()
         started = False
+        self._sweep_background()
         try:
             started = self.meter.begin(key)
         except Exception:
@@ -232,7 +246,52 @@ class DataSaver:
                 self.meter.end(key)  # the work has not happened yet; nothing honest to record
             else:
                 self._finish(key, category, source, detail, session_id)
+                if category == "tool" and source == "terminal":
+                    self._follow_background(detail, payload, result, session_id)
         return result
+
+    # ── background downloads ──────────────────────────────────────────────
+    def _follow_background(self, command: str, args: Any, result: Any, session_id: str) -> None:
+        """A download that Hermes moved to the background keeps using data after its tool call
+        returned. Keep attributing traffic to it until it goes quiet."""
+        try:
+            went_background = (isinstance(args, dict) and bool(args.get("background"))) or (
+                isinstance(result, str) and '"session_id"' in result and "proc_" in result)
+            if not went_background or not command or not looks_like_download(command):
+                return
+            key = object()
+            if not self.meter.begin(key, absorb=True):
+                return
+            now = self._clock()
+            with self._lock:
+                self._background[key] = {"command": command[:200], "session_id": session_id or "",
+                                         "expected": self._expected.get(command, 0), "got": 0,
+                                         "started": now, "checked": now}
+        except Exception:
+            pass
+
+    def _sweep_background(self) -> None:
+        """Write what each background download has used so far; stop following finished ones."""
+        try:
+            with self._lock:
+                following = list(self._background.items())
+            now = self._clock()
+            for key, info in following:
+                usage = self.meter.take(key) or (0, 0)
+                moved = usage[0] + usage[1]
+                if moved:
+                    self.ledger.record("tool", BACKGROUND_SOURCE, rx=usage[0], tx=usage[1],
+                                       session_id=info["session_id"], measured=True, detail=info["command"])
+                    info["got"] += moved
+                quiet = now - info["checked"] >= BACKGROUND_IDLE_SECONDS and moved < BACKGROUND_IDLE_BYTES
+                done = info["expected"] and info["got"] >= info["expected"] * 1.5
+                if quiet or done or now - info["started"] > BACKGROUND_MAX_SECONDS:
+                    self.meter.end(key)
+                    with self._lock:
+                        self._background.pop(key, None)
+                info["checked"] = now
+        except Exception:
+            pass
 
     def _finish(self, key: object, category: str, source: str, detail: str, session_id: str) -> None:
         try:
@@ -245,6 +304,7 @@ class DataSaver:
 
     # ── reporting ─────────────────────────────────────────────────────────
     def status(self) -> dict[str, Any]:
+        self._sweep_background()
         now = self._clock()
         today, month = day_key(now), month_key(now)
         paused = self.paused_until()

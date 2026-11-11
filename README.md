@@ -61,7 +61,7 @@ A prompt or a skill cannot fix that. A prompt can ask the model to be careful; i
 
 `npm`, `apt`, `brew`, `cargo`, `conda`, `playwright install`, `yt-dlp` and similar are recognised as downloads of unknown size. They are flagged once the budget is spent rather than guessed at.
 
-A forecast is a few small metadata requests, capped at six seconds. What they cost is written to the ledger as "size lookups", and package sizes are remembered so the same package is not looked up twice.
+A forecast is a few small metadata requests, capped at ten seconds. What they cost is written to the ledger as "size lookups", and package sizes are remembered so the same package is not looked up twice.
 
 ## Settings
 
@@ -99,7 +99,7 @@ Under cron, the messaging gateway and other unattended runs nobody can answer an
 
 - The network counters are system-wide. Bytes other apps move while a tool call runs are counted against that call. Close the video stream if you want clean numbers.
 - Commands on a remote terminal backend (SSH, Modal, a cloud sandbox) download on that machine, not yours. Forecasts still work; metering only sees this machine.
-- A `background: true` terminal command returns immediately, so only its forecast is counted.
+- A download that Hermes moves to the background is followed until it goes quiet (or for 20 minutes at most). While it runs, all traffic on the machine is counted as that download, including the model requests made meanwhile.
 - Forecasts assume nothing is cached. Packages, layers or files you already have are not downloaded again, so the real figure can be lower.
 - `git clone --depth 1` is reported with the full repository size and a note that it will be less.
 
@@ -110,7 +110,7 @@ pip install pytest
 python -m pytest tests
 ```
 
-88 tests, no network: parsing, every resolver against recorded registry responses, the budget policy, overlap-safe metering, and a check that `register()` matches `plugin.yaml`.
+93 tests, no network: parsing, every resolver against recorded registry responses, the budget policy, overlap-safe metering, and a check that `register()` matches `plugin.yaml`.
 
 ## License
 

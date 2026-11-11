@@ -109,8 +109,8 @@ class Forecast:
 class Fetcher:
     """Small metadata requests with a shared deadline and a running byte count."""
 
-    def __init__(self, opener: Optional[Callable[..., Any]] = None, *, deadline_s: float = 6.0,
-                 timeout_s: float = 4.0, clock: Callable[[], float] = time.monotonic):
+    def __init__(self, opener: Optional[Callable[..., Any]] = None, *, deadline_s: float = 10.0,
+                 timeout_s: float = 6.0, clock: Callable[[], float] = time.monotonic):
         self._open = opener or urllib.request.urlopen
         self._clock = clock
         self._deadline = clock() + deadline_s

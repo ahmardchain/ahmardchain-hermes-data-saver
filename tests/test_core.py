@@ -338,3 +338,92 @@ def test_register_matches_plugin_yaml_and_touches_no_disk_or_network():
     assert sorted(ctx.hooks) == sorted(declared("provides_hooks"))
     assert sorted(ctx.middleware) == sorted(declared("provides_middleware"))
     assert ctx.commands == ["datasaver"]
+
+
+# ── background downloads ──────────────────────────────────────────────────
+
+BG_RESULT = '{"status": "running", "session_id": "proc_abc123", "notify_on_complete": true}'
+
+
+def start_background(saver, counters, command="pip install torch"):
+    saver.pre_tool_call(tool_name="terminal", args={"command": command}, session_id="s1")
+    return saver.tool_execution(tool_name="terminal", args={"command": command},
+                                next_call=lambda a: BG_RESULT, session_id="s1")
+
+
+def test_background_download_absorbs_traffic_instead_of_the_model():
+    counters = Counters()
+    saver = make({"daily_budget_mb": 0, "ask_above_mb": 100000}, counters=counters,
+                 forecasts={"pip install torch": sized(200)})
+    assert start_background(saver, counters) == BG_RESULT
+
+    def model_call(request):
+        counters.rx += 40 * MB  # the download, not the model
+        return {}
+
+    saver.llm_execution(request={}, next_call=model_call, model="m", provider="p")
+    counters.rx += 60 * MB  # between calls: nothing else active, still the download
+    saver.test_clock["now"] += 5
+    status = saver.status()
+    assert status["today_by_category"]["model"] == 0
+    top = {row["source"]: row["bytes"] for row in status["top_today"]}
+    assert top["terminal (background)"] == 100 * MB
+    assert saver.ledger.biggest_calls()[0]["detail"] == "pip install torch"
+
+
+def test_background_following_stops_when_quiet_and_model_is_metered_again():
+    counters = Counters()
+    saver = make({"daily_budget_mb": 0, "ask_above_mb": 100000}, counters=counters,
+                 forecasts={"pip install torch": sized(200)})
+    start_background(saver, counters)
+    counters.rx += 10 * MB
+    saver.test_clock["now"] += 30
+    saver.status()                      # 10 MB moved: still following
+    saver.test_clock["now"] += 30
+    saver.status()                      # nothing moved for 30 s: stop
+    assert saver._background == {}
+
+    def model_call(request):
+        counters.rx += MB
+        return {}
+
+    saver.llm_execution(request={}, next_call=model_call, model="m", provider="p")
+    assert saver.ledger.by_category()["model"] == MB
+
+
+def test_background_following_stops_at_one_and_a_half_times_the_forecast_and_on_timeout():
+    counters = Counters()
+    saver = make({"daily_budget_mb": 0, "ask_above_mb": 100000}, counters=counters,
+                 forecasts={"pip install torch": sized(10)})
+    start_background(saver, counters)
+    counters.rx += 16 * MB
+    saver.status()
+    assert saver._background == {}
+    start_background(saver, counters)
+    counters.rx += MB
+    saver.test_clock["now"] += 21 * 60
+    saver.status()
+    assert saver._background == {}
+
+
+def test_background_servers_and_foreground_commands_are_not_followed():
+    counters = Counters()
+    saver = make(counters=counters)
+    saver.tool_execution(tool_name="terminal", args={"command": "npm run dev", "background": True},
+                         next_call=lambda a: BG_RESULT)
+    saver.tool_execution(tool_name="terminal", args={"command": "pip install requests"},
+                         next_call=lambda a: '{"output": "ok", "exit_code": 0}')
+    assert saver._background == {}
+
+
+def test_meter_take_keeps_the_call_running():
+    counters = Counters()
+    meter = Meter(counters)
+    meter.begin("bg", absorb=True)
+    meter.begin("call")
+    counters.rx += 1000
+    assert meter.take("bg") == (1000, 0)
+    assert meter.end("call") == (0, 0)
+    counters.rx += 500
+    assert meter.end("bg") == (500, 0)
+    assert meter.take("gone") is None
